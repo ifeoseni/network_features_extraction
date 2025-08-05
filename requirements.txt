@@ -1,0 +1,7 @@
+pandas
+cloudscraper
+beautifulsoup4
+tldextract
+whois
+dnspython
+requests

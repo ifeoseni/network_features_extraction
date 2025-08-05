@@ -1,141 +1,163 @@
-#!/usr/bin/env python3
-"""
-HTTP-status checker with Cloudscraper + FlareSolverr fallback
-- Adds http_status, is_active, has_redirect columns *in place*
-- Streams output → safe for very large files
-- Keeps original columns untouched
-CLI unchanged: --input-file cleaned_data/1.csv --output-dir http_status
-"""
-
-import argparse, asyncio, aiohttp, cloudscraper, json, logging, os, sys, ssl
-from datetime import datetime
-from pathlib import Path
+import os
+import re
+import ssl
+import gc
+import asyncio
+import logging
+import argparse
 import pandas as pd
-# import tqdm.asyncio as tqdm
-from tqdm.asyncio import tqdm_asyncio 
+from datetime import datetime
+from playwright.async_api import async_playwright
+import httpx
 
-# ---------- CONFIG ---------------------------------------------------------
-CLOUDSCRAPER = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────
+MAX_CONCURRENT = 10
+REQUEST_TIMEOUT = 15
+USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
 )
-FLARE_ENDPOINT = os.getenv("FLARE_ENDPOINT", "http://localhost:8191/v1")
-MAX_CONCURRENT = 100
-REQUEST_TIMEOUT = 20
-BATCH_SIZE = 1000
-RETRY_CODES = {403, 503, 429}
+BATCH_SIZE = 500
+
+# Set up logger to also write to file later
+log = logging.getLogger("status_checker")
+log.setLevel(logging.INFO)
+console_handler = logging.StreamHandler()
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+console_handler.setFormatter(formatter)
+log.addHandler(console_handler)
 
 ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("http_status.log", encoding="utf-8"),
-    ],
-)
-log = logging.getLogger("checker")
-
-# ---------- UTILITIES ------------------------------------------------------
 def ensure_scheme(url: str) -> str:
-    url = str(url).strip()
-    if not url:
+    if not url or not isinstance(url, str) or not url.strip():
         return ""
-    return url if url.startswith(("http://", "https://")) else f"https://{url}"
+    url = url.strip()
+    return url if re.match(r"https?://", url, re.IGNORECASE) else f"https://{url}"
 
-# ---------- CHECKERS -------------------------------------------------------
-async def cloud_get(url: str) -> dict:
-    loop = asyncio.get_event_loop()
+async def fetch_httpx(client: httpx.AsyncClient, url: str) -> dict:
     try:
-        r = await loop.run_in_executor(
-            None, CLOUDSCRAPER.get, url, {"timeout": REQUEST_TIMEOUT}
-        )
+        r = await client.get(url, timeout=REQUEST_TIMEOUT)
         return {
             "http_status": r.status_code,
-            "is_active": int(r.status_code > 0),
+            "is_active": 1,
             "has_redirect": int(bool(r.history)),
-            "error": "",
+            "error": ""
         }
-    except cloudscraper.exceptions.CloudflareChallengeError:
-        return {"http_status": 503, "is_active": 0, "has_redirect": 0, "error": "cf_v2"}
     except Exception as e:
         return {"http_status": 0, "is_active": 0, "has_redirect": 0, "error": str(e)}
 
-async def flare_get(session: aiohttp.ClientSession, url: str) -> dict:
-    payload = {"cmd": "request.get", "url": url, "maxTimeout": 60_000}
+async def fetch_playwright(browser, url: str) -> dict:
+    page = await browser.new_page(user_agent=USER_AGENT)
     try:
-        async with session.post(FLARE_ENDPOINT, json=payload, timeout=70) as resp:
-            data = await resp.json()
-            sol = data.get("solution", {})
-            status = sol.get("status", 0)
-            return {
-                "http_status": status,
-                "is_active": int(status > 0),
-                "has_redirect": 0,  # FlareSolverr does not expose history
-                "error": "",
-            }
+        await page.route("**/*", lambda route, request: (
+            route.abort() if request.resource_type in ["image", "stylesheet", "font", "media"] else route.continue_()
+        ))
+        resp = await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        status = resp.status if resp else 0
+        return {
+            "http_status": status,
+            "is_active": int(bool(status)),
+            "has_redirect": 0,
+            "error": ""
+        }
     except Exception as e:
-        return {"http_status": 0, "is_active": 0, "has_redirect": 0, "error": str(e)}
+        return {
+            "http_status": 0,
+            "is_active": 0,
+            "has_redirect": 0,
+            "error": str(e)
+        }
+    finally:
+        await page.close()
 
-async def check_url(url: str, session: aiohttp.ClientSession) -> dict:
-    url = ensure_scheme(url)
-    if not url:
-        return {"http_status": 0, "is_active": 0, "has_redirect": 0, "error": "Empty URL"}
+async def check_url(batch_client, playwright_ctx, browser, sem, row: pd.Series) -> dict:
+    url = ensure_scheme(row.get('url', ''))
+    async with sem:
+        if not url:
+            return {**row.to_dict(), "http_status": 0, "is_active": 0, "has_redirect": 0, "error": "Empty or invalid URL"}
 
-    first = await cloud_get(url)
-    if first["http_status"] in RETRY_CODES or first["error"] == "cf_v2":
-        return await flare_get(session, url)
-    return first
+        hx = await fetch_httpx(batch_client, url)
+        if hx["http_status"] > 0:
+            return {**row.to_dict(), **hx}
 
-# ---------- MAIN -----------------------------------------------------------
-async def process_file(input_csv: Path, output_csv: Path) -> None:
-    df = pd.read_csv(input_csv, engine="python", on_bad_lines="skip", dtype=str)
-    if "url" not in df.columns:
-        log.error("No 'url' column in %s", input_csv)
-        return
+        if playwright_ctx and browser:
+            pw = await fetch_playwright(browser, url)
+            if pw["http_status"] == 0 and hx["error"]:
+                pw["error"] = hx["error"]
+            return {**row.to_dict(), **pw}
 
-    # Safely drop the four columns if they already exist
-    df.drop(
-        columns=[c for c in ["http_status", "is_active", "has_redirect", "error"]
-                 if c in df.columns],
-        inplace=True
-    )
+        return {**row.to_dict(), **hx}
 
-    urls = df["url"].dropna().tolist()
-    total = len(urls)
+async def process_batches(df: pd.DataFrame, output_file: str):
+    columns = list(df.columns) + ["http_status", "is_active", "has_redirect", "error"]
+    pd.DataFrame(columns=columns).to_csv(output_file, index=False)
 
-    conn = aiohttp.TCPConnector(limit=MAX_CONCURRENT, ssl=ssl_ctx)
-    async with aiohttp.ClientSession(connector=conn) as session:
-        sem = asyncio.Semaphore(MAX_CONCURRENT)
+    total = len(df)
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+    playwright_ctx, browser = None, None
 
-        async def sem_worker(u):
-            async with sem:
-                return await check_url(u, session)
+    try:
+        playwright_ctx = await async_playwright().start()
+        browser = await playwright_ctx.chromium.launch(headless=True)
 
-        tasks = [sem_worker(u) for u in urls]
-        # results = await tqdm.gather(*tasks, total=total, desc=str(input_csv.name))
-        results = await tqdm_asyncio.gather(*tasks, total=total, desc=str(input_csv.name))
-    # Merge results back into the original DataFrame
-    res_df = pd.DataFrame(results)
-    for col in ["http_status", "is_active", "has_redirect", "error"]:
-        df[col] = res_df[col]
+        for batch_start in range(0, total, BATCH_SIZE):
+            batch = df.iloc[batch_start:batch_start + BATCH_SIZE]
+            log.info(f" Processing rows {batch_start + 1}–{batch_start + len(batch)} of {total}")
 
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_csv, index=False)
-    log.info("Finished %s → %s", input_csv, output_csv)
+            headers = {
+                "User-Agent": USER_AGENT,
+                "Accept-Encoding": "gzip, deflate, br"
+            }
+            batch_client = httpx.AsyncClient(
+                http2=False,
+                follow_redirects=True,
+                verify=ssl_ctx,
+                headers=headers
+            )
 
-def main():
-    parser = argparse.ArgumentParser(description="Add HTTP-status columns to CSV")
-    parser.add_argument("--input-file", required=True, help="CSV with 'url' column")
-    parser.add_argument("--output-dir", required=True, help="Folder for updated CSV")
-    args = parser.parse_args()
+            tasks = [check_url(batch_client, playwright_ctx, browser, sem, row) for _, row in batch.iterrows()]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
 
-    in_path = Path(args.input_file)
-    out_path = Path(args.output_dir) / in_path.name
+            pd.DataFrame(results).to_csv(output_file, mode="a", header=False, index=False)
+            await batch_client.aclose()
+            gc.collect()
 
-    asyncio.run(process_file(in_path, out_path))
+    finally:
+        if browser:
+            await browser.close()
+        if playwright_ctx:
+            await playwright_ctx.stop()
+
+    log.info(f" All batches complete. Results saved to {output_file}")
+
+def main(input_file: str, output_dir: str):
+    os.makedirs(output_dir, exist_ok=True)
+
+    input_name = os.path.splitext(os.path.basename(input_file))[0]
+    output_csv = os.path.join(output_dir, f"{input_name}_results.csv")
+    output_log = os.path.join(output_dir, f"{input_name}_log.txt")
+
+    # Write all log output to file
+    file_handler = logging.FileHandler(output_log)
+    file_handler.setFormatter(formatter)
+    log.addHandler(file_handler)
+
+    df = pd.read_csv(input_file, engine="python", on_bad_lines="skip", encoding="utf-8")
+
+    asyncio.run(process_batches(df, output_csv))
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Batch-safe HTTP status checker")
+    parser.add_argument("--input-file", required=True, help="Path to input CSV")
+    parser.add_argument("--output-dir", required=True, help="Directory for output CSV and logs")
+    args = parser.parse_args()
+    main(args.input_file, args.output_dir)
+
+# python http_status_checker.py --input-file split/PhiUSIIL_cleaned_v2_84001_94000.csv --output-dir http_status/split
+# python http_status_checker.py --input-file split/PhiUSIIL_cleaned_v2_134001_144000.csv --output-dir http_status/split
+# python http_status_checker.py --input-file split/PhiUSIIL_cleaned_v2_194001_204000.csv --output-dir http_status/split
+# python http_status_checker.py --input-file split/Mendeley_cleaned_v2_400001_410000_refuse_to_continue.csv --output-dir http_status/split

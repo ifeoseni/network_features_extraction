@@ -1,0 +1,7 @@
+url,label,source,http_status,is_active,has_redirect,error
+https://delonapps.com,0.0,2.0,200,1,1,
+https://nigeriariskindex.com,0.0,2.0,200,1,1,
+https://www.blueridgeparkwaystore.com/,0.0,2.0,0,0,0,[Errno -2] Name or service not known
+https://www.https://www.burmasun.com/,0.0,2.0,200,1,0,
+https://www.blues.about.com/,0.0,2.0,200,1,1,
+https://www.delonapps.com/0,,,404,1,0,
