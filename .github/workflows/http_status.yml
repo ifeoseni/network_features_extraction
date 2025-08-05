@@ -1,3 +1,4 @@
+# .github/workflows/http_status.yml
 name: Auto HTTP Status – cleaned_data/*.csv (manual only)
 
 on:
@@ -15,24 +16,27 @@ jobs:
   discover:
     runs-on: ubuntu-latest
     outputs:
-      files: ${{ steps.set.outputs.files }}
+      matrix: ${{ steps.set.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
       - id: set
         run: |
           if [ -z "${{ github.event.inputs.csv_file }}" ]; then
-            files=$(find cleaned_data -name '*.csv' | jq -R -s -c 'split("\n") | map(select(. != ""))')
+            files=(cleaned_data/*.csv)
           else
-            files=$(echo '["cleaned_data/${{ github.event.inputs.csv_file }}"]')
+            files=("cleaned_data/${{ github.event.inputs.csv_file }}")
           fi
-          echo "files=$files" >> $GITHUB_OUTPUT
+
+          # Build JSON array of simple strings
+          json=$(printf '%s\n' "${files[@]}" | jq -R . | jq -s .)
+          echo "matrix=$json" >> $GITHUB_OUTPUT
 
   scrape:
     needs: discover
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        file: ${{ fromJson(needs.discover.outputs.files) }}
+        file: ${{ fromJson(needs.discover.outputs.matrix) }}
     services:
       flaresolverr:
         image: flaresolverr/flaresolverr

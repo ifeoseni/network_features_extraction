@@ -11,7 +11,8 @@ import argparse, asyncio, aiohttp, cloudscraper, json, logging, os, sys, ssl
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
-import tqdm.asyncio as tqdm
+# import tqdm.asyncio as tqdm
+from tqdm.asyncio import tqdm_asyncio 
 
 # ---------- CONFIG ---------------------------------------------------------
 CLOUDSCRAPER = cloudscraper.create_scraper(
@@ -114,8 +115,8 @@ async def process_file(input_csv: Path, output_csv: Path) -> None:
                 return await check_url(u, session)
 
         tasks = [sem_worker(u) for u in urls]
-        results = await tqdm.gather(*tasks, total=total, desc=str(input_csv.name))
-
+        # results = await tqdm.gather(*tasks, total=total, desc=str(input_csv.name))
+        results = await tqdm_asyncio.gather(*tasks, total=total, desc=str(input_csv.name))
     # Merge results back into the original DataFrame
     res_df = pd.DataFrame(results)
     for col in ["http_status", "is_active", "has_redirect", "error"]:
@@ -124,7 +125,7 @@ async def process_file(input_csv: Path, output_csv: Path) -> None:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False)
     log.info("Finished %s → %s", input_csv, output_csv)
-    
+
 def main():
     parser = argparse.ArgumentParser(description="Add HTTP-status columns to CSV")
     parser.add_argument("--input-file", required=True, help="CSV with 'url' column")
