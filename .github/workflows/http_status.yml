@@ -1,0 +1,70 @@
+name: Auto HTTP Status – all cleaned_data/*.csv
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "1 22 * * *" # daily 22:01 UTC
+
+env:
+  FLARE_ENDPOINT: http://localhost:8191/v1
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        file: ${{ fromJson(needs.discover.outputs.files) }}
+    services:
+      flaresolverr:
+        image: flaresolverr/flaresolverr
+        ports:
+          - 8191:8191
+    needs: discover
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fetch-depth: 0
+
+      - name: Install SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install cloudscraper pandas aiohttp aiofiles tqdm
+
+      - name: Run HTTP-status checker
+        run: |
+          mkdir -p http_status
+          python http_status_finder.py \
+            --input-file "${{ matrix.file }}" \
+            --output-dir http_status
+
+      - name: Commit & push updated CSV
+        run: |
+          git config user.name  "Ifeoluwa Oseni"
+          git config user.email "ifeoseni@gmail.com"
+          git add "http_status/$(basename '${{ matrix.file }}')"
+          git diff --cached --quiet || {
+            git commit -m "chore: update http_status/$(basename '${{ matrix.file }}')"
+            git push origin HEAD:${{ github.ref }}
+          }
+
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      files: ${{ steps.set.outputs.files }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set
+        run: |
+          FILES=$(find cleaned_data -name '*.csv' | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
