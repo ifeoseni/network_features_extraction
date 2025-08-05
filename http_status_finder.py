@@ -95,10 +95,12 @@ async def process_file(input_csv: Path, output_csv: Path) -> None:
         log.error("No 'url' column in %s", input_csv)
         return
 
-    # fix: drop columns safely
-    for col in ["http_status", "is_active", "has_redirect", "error"]:
-        if col in df.columns:
-            df.drop(columns=[col], inplace=True)
+    # Safely drop the four columns if they already exist
+    df.drop(
+        columns=[c for c in ["http_status", "is_active", "has_redirect", "error"]
+                 if c in df.columns],
+        inplace=True
+    )
 
     urls = df["url"].dropna().tolist()
     total = len(urls)
@@ -106,6 +108,7 @@ async def process_file(input_csv: Path, output_csv: Path) -> None:
     conn = aiohttp.TCPConnector(limit=MAX_CONCURRENT, ssl=ssl_ctx)
     async with aiohttp.ClientSession(connector=conn) as session:
         sem = asyncio.Semaphore(MAX_CONCURRENT)
+
         async def sem_worker(u):
             async with sem:
                 return await check_url(u, session)
@@ -113,7 +116,7 @@ async def process_file(input_csv: Path, output_csv: Path) -> None:
         tasks = [sem_worker(u) for u in urls]
         results = await tqdm.gather(*tasks, total=total, desc=str(input_csv.name))
 
-    # merge results
+    # Merge results back into the original DataFrame
     res_df = pd.DataFrame(results)
     for col in ["http_status", "is_active", "has_redirect", "error"]:
         df[col] = res_df[col]
@@ -121,6 +124,7 @@ async def process_file(input_csv: Path, output_csv: Path) -> None:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False)
     log.info("Finished %s → %s", input_csv, output_csv)
+    
 def main():
     parser = argparse.ArgumentParser(description="Add HTTP-status columns to CSV")
     parser.add_argument("--input-file", required=True, help="CSV with 'url' column")
