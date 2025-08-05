@@ -1,36 +1,52 @@
-name: Extract Network Features from Selected CSVs (Manual)
+name: Extract Network Features (Matrix Mode)
 
 on:
   workflow_dispatch:
     inputs:
-      file1:
-        description: "First CSV file path (e.g., http_status/file1.csv)"
+      files:
+        description: "Comma-separated list of CSV files (e.g., http_status/1.csv,http_status/2.csv)"
         required: true
-        default: "http_status/1.csv"
-        type: string
-      file2:
-        description: "Second CSV file path (optional)"
-        required: false
-        default: "http_status/2.csv"
-        type: string
-      file3:
-        description: "Third CSV file path (optional)"
-        required: false
-        default: "http_status/3.csv"
         type: string
       output_folder:
-        description: "Output folder for network features (e.g., network_features)"
+        description: "Output folder (e.g., network_features)"
         required: true
         default: "network_features"
-        type: string
 
 jobs:
-  run-network-analysis:
+  validate-and-split:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # 5h 50m (safe limit under 6h)
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Parse Input Files
+        id: set-matrix
+        run: |
+          IFS=',' read -ra FILE_LIST <<< "${{ github.event.inputs.files }}"
+          json="{\"include\": ["
+          for file in "${FILE_LIST[@]}"; do
+            file=$(echo "$file" | xargs)  # trim
+            if [ ! -f "$file" ]; then
+              echo "::error::Input file not found: $file"
+              exit 1
+            fi
+            output_file="${{ github.event.inputs.output_folder }}/$(basename "$file")"
+            json="$json {\"input_file\": \"$file\", \"output_file\": \"$output_file\"},"
+          done
+          # Remove trailing comma and close JSON
+          json="${json%,} ]}"
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "$json" | jq .
+
+  run-network-analysis:
+    needs: validate-and-split
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.validate-and-split.outputs.matrix) }}
 
     steps:
-      - name: Checkout repository via SSH
+      - name: Checkout repo via SSH
         uses: actions/checkout@v4
         with:
           ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -50,57 +66,35 @@ jobs:
 
       - name: Create output directory
         run: |
-          mkdir -p "${{ github.event.inputs.output_folder }}"
-
-      - name: Validate and Process Input Files
-        id: process_files
-        run: |
-          declare -a input_files=("${{ github.event.inputs.file1 }}" "${{ github.event.inputs.file2 }}" "${{ github.event.inputs.file3 }}")
-          valid_files=()
-          for file in "${input_files[@]}"; do
-            if [ -z "$file" ]; then
-              continue
-            fi
-            if [ -f "$file" ]; then
-              echo "✅ Found input file: $file"
-              valid_files+=("$file")
-            else
-              echo "::error::Input file not found: $file"
-              exit 1
-            fi
-          done
-          if [ ${#valid_files[@]} -eq 0 ]; then
-            echo "::error::No valid input files provided."
-            exit 1
-          fi
-          echo "Valid files to process: ${valid_files[*]}"
-          echo "files_list=${valid_files[*]}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$(dirname "${{ matrix.output_file }}")"
 
       - name: Run Network Feature Extraction
         run: |
-          IFS=' ' read -r -a input_files <<< "${{ steps.process_files.outputs.files_list }}"
-          OUTPUT_DIR="${{ github.event.inputs.output_folder }}"
-          for input_csv in "${input_files[@]}"; do
-            if [ -f "$input_csv" ]; then
-              echo "🚀 Processing: $input_csv"
-              python network_feature_extractor.py --input "$input_csv" --output "$OUTPUT_DIR"
-            else
-              echo "::warning::Skipped missing file: $input_csv"
-            fi
-          done
+          python network_feature_extractor.py \
+            --input "${{ matrix.input_file }}" \
+            --output "$(dirname "${{ matrix.output_file }}")"
 
-      - name: Verify Output Files
+      - name: Verify output
         run: |
-          OUTPUT_DIR="${{ github.event.inputs.output_folder }}"
-          echo "🔍 Checking output directory: $OUTPUT_DIR"
-          if ls "$OUTPUT_DIR"/*.csv 1> /dev/null 2>&1; then
-            for file in "$OUTPUT_DIR"/*.csv; do
-              echo "✅ Generated: $(basename "$file")"
-              head -n1 "$file"
-            done
+          if [ -f "${{ matrix.output_file }}" ]; then
+            echo "✅ Generated: ${{ matrix.output_file }}"
+            head -n1 "${{ matrix.output_file }}"
           else
-            echo "::warning::No output CSV files generated in $OUTPUT_DIR"
+            echo "::error::Failed to generate ${{ matrix.output_file }}"
+            exit 1
           fi
+
+  commit-results:
+    needs: run-network-analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          repository: ${{ github.repository }}
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Commit and Push Network Features
         env:
@@ -109,19 +103,14 @@ jobs:
           git config user.name "Ifeoluwa Oseni"
           git config user.email "ifeoseni@gmail.com"
 
-          OUTPUT_DIR="${{ github.event.inputs.output_folder }}"
-          git add "$OUTPUT_DIR"/*.csv
+          # Add all network feature outputs
+          git add ${{ github.event.inputs.output_folder }}/*.csv
 
           if ! git diff --cached --quiet; then
-            git commit -m "feat: add extracted network features from selected files [skip ci]"
-            echo "✅ Committed network features to repo"
+            git commit -m "feat: add network features from ${{ github.event.inputs.files }} [skip ci]"
+            git pull origin main --rebase || echo "Rebase conflict? Skipping push."
+            git push origin main
+            echo "✅ Committed and pushed results"
           else
-            echo "➡️  No new changes to commit"
-            exit 0
+            echo "➡️ No new changes to commit"
           fi
-
-          git remote set-url origin git@github.com:${{ github.repository }}.git
-          git pull origin main --rebase || echo "⚠️ Rebase conflict? Skipping push (safe to retry)"
-          git push origin main
-
-          echo "🎉 Network features successfully pushed to the repository"

@@ -412,8 +412,30 @@ async def main(input_csv: str, output_csv: str):
     logger.info(f"Completed: {output_csv}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", "-i", required=True)
-    parser.add_argument("--output", "-o", required=True)
+    parser = argparse.ArgumentParser(description="Extract network features from URLs in a CSV file.")
+    parser.add_argument("--input", required=True, help="Path to the input CSV file containing URLs.")
+    parser.add_argument("--output", required=True, help="Path to the output directory to save extracted features.")
     args = parser.parse_args()
-    asyncio.run(main(args.input, args.output))
+
+    # --- SAFETY: Ensure output is a proper directory path ---
+    input_path = args.input.strip()
+    output_dir = args.output.strip()
+
+    if not os.path.exists(input_path):
+        logger.error(f"Input file not found: {input_path}")
+        sys.exit(1)
+
+    if not os.path.isfile(input_path):
+        logger.error(f"Input is not a file: {input_path}")
+        sys.exit(1)
+
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Build output path
+    input_filename = os.path.basename(input_path)
+    output_csv = os.path.join(output_dir, input_filename)
+
+    logger.info(f"Processing {input_path} → {output_csv}")
+
+    asyncio.run(main(input_path, output_csv))
