@@ -90,20 +90,19 @@ async def check_url(url: str, session: aiohttp.ClientSession) -> dict:
 
 # ---------- MAIN -----------------------------------------------------------
 async def process_file(input_csv: Path, output_csv: Path) -> None:
-    # read only the URL column plus any existing status columns
     df = pd.read_csv(input_csv, engine="python", on_bad_lines="skip", dtype=str)
     if "url" not in df.columns:
         log.error("No 'url' column in %s", input_csv)
         return
 
-    # drop any previous status columns we’ll overwrite
-    for col in ("http_status", "is_active", "has_redirect", "error"):
-        df.pop(col, None)
+    # fix: drop columns safely
+    for col in ["http_status", "is_active", "has_redirect", "error"]:
+        if col in df.columns:
+            df.drop(columns=[col], inplace=True)
 
     urls = df["url"].dropna().tolist()
     total = len(urls)
 
-    # aiohttp session for FlareSolverr
     conn = aiohttp.TCPConnector(limit=MAX_CONCURRENT, ssl=ssl_ctx)
     async with aiohttp.ClientSession(connector=conn) as session:
         sem = asyncio.Semaphore(MAX_CONCURRENT)
@@ -114,16 +113,14 @@ async def process_file(input_csv: Path, output_csv: Path) -> None:
         tasks = [sem_worker(u) for u in urls]
         results = await tqdm.gather(*tasks, total=total, desc=str(input_csv.name))
 
-    # merge results into original dataframe
+    # merge results
     res_df = pd.DataFrame(results)
-    for col in ("http_status", "is_active", "has_redirect", "error"):
+    for col in ["http_status", "is_active", "has_redirect", "error"]:
         df[col] = res_df[col]
 
-    # ensure directory exists
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False)
     log.info("Finished %s → %s", input_csv, output_csv)
-
 def main():
     parser = argparse.ArgumentParser(description="Add HTTP-status columns to CSV")
     parser.add_argument("--input-file", required=True, help="CSV with 'url' column")
