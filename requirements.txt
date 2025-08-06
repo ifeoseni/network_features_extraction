@@ -4,4 +4,7 @@ beautifulsoup4
 tldextract
 whois
 dnspython
+aiohttp
 requests
+selenium
+undetected-chromedriver

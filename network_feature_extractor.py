@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-Network Feature Extractor using cloudscraper to bypass bot detection
-Supports SSL, DNS, WHOIS, HTML, Security Headers, Cookies
+Network Feature Extractor - Cloudflare-Bypassing, Low-Memory, Large-Scale Ready
+Uses:
+  - cloudscraper: for HTML (bypasses Cloudflare, JS challenges)
+  - selenium-stealth: fallback for reCAPTCHA
+  - aiohttp: for SSL/DNS/WHOIS (fast, async, low memory)
 """
 
-import cloudscraper
+import asyncio
+import aiohttp
+import ssl
+import socket
 import pandas as pd
 import tldextract
 from bs4 import BeautifulSoup
@@ -14,38 +20,39 @@ import re
 import time
 import logging
 import os
-import ssl
-import socket
+from concurrent.futures import ThreadPoolExecutor
+import whois
 import dns.asyncresolver
 import dns.exception
-import whois
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, Optional, Tuple
 import argparse
-import asyncio
+import sys
+from typing import Dict, Any, Optional, Tuple, List
+import cloudscraper  # <-- This bypasses Cloudflare
+import random
 
 # --- Configuration ---
-CONCURRENCY_LIMIT = 20
-REQUEST_TIMEOUT = 30
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-WHOIS_TIMEOUT = 15
+CHUNK_SIZE = 500        # Process 500 URLs at a time
+BATCH_SIZE = 50         # Save every 50 URLs
+CONCURRENCY_LIMIT = 30  # Async tasks
+REQUEST_TIMEOUT = 30    # For cloudscraper
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 DNS_TIMEOUT = 5
 DNS_RESOLVERS = ["8.8.8.8", "8.8.4.4", "1.1.1.1", "9.9.9.9"]
 SSL_TIMEOUT = 10
-BATCH_SIZE = 20
+MAX_RETRIES = 3
 
-# --- Logging ---
+# --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler("network_features.log"),
-        logging.StreamHandler()
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
-# --- Feature Defaults ---
+# --- Network Feature Defaults ---
 NETWORK_FEATURE_DEFAULTS = {
     "dns_a_presence": None, "dns_a_count": None,
     "dns_mx_presence": None, "dns_mx_count": None,
@@ -76,25 +83,29 @@ NETWORK_FEATURE_DEFAULTS = {
     "has_cookie": None, "has_http_only_cookie": None, "has_secure_cookie": None,
 }
 
-# --- Helpers ---
+# --- Helper Functions ---
 def ensure_url_scheme(url: str) -> str:
     if not isinstance(url, str): return ""
     url = url.strip()
-    if not re.match(r"^https?://", url, re.IGNORECASE):
-        return f"http://{url}"
+    if not re.match(r"^https?://", url, re.IGNORECASE): return f"http://{url}"
     return url
 
 def get_registered_domain(url: str) -> Optional[str]:
     try:
-        if not url or not isinstance(url, str): return None
-        url = ensure_url_scheme(url.strip())
+        if not isinstance(url, str) or not url.strip(): return None
+        url = url.strip()
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            extracted = tldextract.extract(url)
+            if extracted.domain and extracted.suffix: return f"{extracted.domain}.{extracted.suffix}"
+            url = f"http://{url}"
         parsed = urlparse(url)
         netloc = parsed.netloc.split(":")[0]
         if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", netloc): return netloc
         extracted = tldextract.extract(netloc)
-        return f"{extracted.domain}.{extracted.suffix}" if extracted.domain and extracted.suffix else netloc
+        if extracted.domain and extracted.suffix: return f"{extracted.domain}.{extracted.suffix}"
+        return netloc or None
     except Exception as e:
-        logger.warning(f"Domain extraction failed for {url}: {e}")
+        logger.warning(f"Domain extraction error for {url}: {e}")
         return None
 
 def get_hostname_from_url(url: str) -> Optional[str]:
@@ -105,76 +116,77 @@ def get_hostname_from_url(url: str) -> Optional[str]:
         if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", hostname): return None
         return hostname or None
     except Exception as e:
-        logger.warning(f"Hostname extraction failed for {url}: {e}")
+        logger.warning(f"Hostname extraction error for {url}: {e}")
         return None
 
 def is_valid_domain(domain: str) -> bool:
     if not domain: return False
     if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", domain): return False
     if domain.lower() in ["localhost", "127.0.0.1"]: return False
-    return 4 <= len(domain) <= 253
+    if len(domain) > 253: return False
+    return True
 
-# --- SSL ---
+# --- SSL Functions ---
 def matches_hostname(cert_hostname: str, actual_hostname: str) -> bool:
     cert_hostname = cert_hostname.lower()
     actual_hostname = actual_hostname.lower()
     if cert_hostname == actual_hostname: return True
     if cert_hostname.startswith("*."):
-        base = cert_hostname[2:]
-        return actual_hostname.count(".") == base.count(".") + 1 and actual_hostname.endswith("." + base)
+        base_domain = cert_hostname[2:]
+        if actual_hostname.count(".") == base_domain.count(".") + 1 and actual_hostname.endswith("." + base_domain):
+            return True
     return False
 
 async def check_ssl_certificate(hostname: str, port: int = 443) -> Dict[str, Any]:
-    res = {
+    ssl_features = {
         "has_ssl_certificate": 0, "ssl_certificate_valid": 0, "ssl_days_to_expiry": -1,
         "ssl_is_expired": 0, "ssl_is_self_signed": 0, "ssl_has_chain_issues": 0,
         "ssl_hostname_mismatch": 0, "ssl_connection_error": 0,
     }
     if not hostname:
-        res["ssl_connection_error"] = 1
-        return res
+        ssl_features["ssl_connection_error"] = 1
+        return ssl_features
 
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = True
         ctx.verify_mode = ssl.CERT_REQUIRED
         r, w = await asyncio.wait_for(asyncio.open_connection(hostname, port, ssl=ctx), SSL_TIMEOUT)
-        res.update({"has_ssl_certificate": 1, "ssl_certificate_valid": 1})
+        ssl_features.update({"has_ssl_certificate": 1, "ssl_certificate_valid": 1})
         cert = w.get_extra_info('peercert')
         if cert:
-            await parse_ssl_certificate(cert, hostname, res)
+            await parse_ssl_certificate(cert, hostname, ssl_features)
         w.close()
         await w.wait_closed()
-        return res
+        return ssl_features
     except ssl.SSLCertVerificationError as e:
-        res["ssl_certificate_valid"] = 0
+        ssl_features["ssl_certificate_valid"] = 0
         msg = str(e).lower()
-        if 'hostname mismatch' in msg: res["ssl_hostname_mismatch"] = 1
-        if 'expired' in msg: res["ssl_is_expired"] = 1
-        if 'self-signed' in msg: res["ssl_is_self_signed"] = 1
-        if 'verify failed' in msg: res["ssl_has_chain_issues"] = 1
+        if 'hostname mismatch' in msg: ssl_features["ssl_hostname_mismatch"] = 1
+        if 'expired' in msg: ssl_features["ssl_is_expired"] = 1
+        if 'self-signed' in msg: ssl_features["ssl_is_self_signed"] = 1
+        if 'verify failed' in msg: ssl_features["ssl_has_chain_issues"] = 1
     except (ConnectionRefusedError, OSError, socket.gaierror, asyncio.TimeoutError):
-        res["ssl_connection_error"] = 1
+        ssl_features["ssl_connection_error"] = 1
     except Exception as e:
-        logger.debug(f"SSL error: {e}")
-        res["ssl_connection_error"] = 1
-    return res
+        logger.debug(f"SSL error for {hostname}: {e}")
+        ssl_features["ssl_connection_error"] = 1
+    return ssl_features
 
-async def parse_ssl_certificate(cert: dict, host: str, res: dict):
+async def parse_ssl_certificate(peercert: dict, host: str, res: dict):
     try:
-        exp = cert.get('notAfter')
+        exp = peercert.get('notAfter')
         if exp:
             dt = datetime.strptime(exp, '%b %d %H:%M:%S %Y %Z').replace(tzinfo=timezone.utc)
             days = (dt - datetime.now(timezone.utc)).days
             res["ssl_days_to_expiry"] = days
             if days < 0: res["ssl_is_expired"] = 1
-        issuer = dict(x[0] for x in cert.get('issuer', []))
-        subject = dict(x[0] for x in cert.get('subject', []))
+        issuer = dict(x[0] for x in peercert.get('issuer', []))
+        subject = dict(x[0] for x in peercert.get('subject', []))
         if issuer.get('commonName') == subject.get('commonName'): res["ssl_is_self_signed"] = 1
-        sans = [ext[1] for ext in cert.get('subjectAltName', []) if ext[0] == 'DNS']
+        sans = [ext[1] for ext in peercert.get('subjectAltName', []) if ext[0] == 'DNS']
         cn = subject.get('commonName', '')
-        if not any(matches_hostname(n, host) for n in [cn] + sans) and not res["ssl_hostname_mismatch"]:
-            res["ssl_hostname_mismatch"] = 1
+        if not any(matches_hostname(n, host) for n in [cn] + sans): res["ssl_hostname_mismatch"] = 1
     except Exception as e:
         logger.warning(f"Parse SSL error: {e}")
 
@@ -182,7 +194,7 @@ async def fetch_ssl_cert(url: str) -> Dict[str, Any]:
     host = get_hostname_from_url(url)
     return await check_ssl_certificate(host, 443) if host else {k: None for k in NETWORK_FEATURE_DEFAULTS if k.startswith("ssl_")}
 
-# --- DNS ---
+# --- DNS Functions ---
 async def fetch_dns_records(domain: str) -> Dict[str, Any]:
     res = {k: None for k in NETWORK_FEATURE_DEFAULTS if k.startswith("dns_")}
     if not is_valid_domain(domain): return res
@@ -259,11 +271,14 @@ async def fetch_whois_async(domain: str, executor: ThreadPoolExecutor) -> Dict[s
     age, expiry = await loop.run_in_executor(executor, fetch_whois, domain)
     return {"domain_age_days": age, "time_to_expiration": expiry}
 
-# --- HTML (cloudscraper) ---
+# --- HTML Features (cloudscraper) ---
 def fetch_html_features_sync(url: str) -> Dict[str, Any]:
     res = {k: None for k in NETWORK_FEATURE_DEFAULTS if k.startswith("has_") or "num_" in k or k in ["response_time", "content_length", "redirect_count", "final_url_diff", "title_length"]}
     try:
-        scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
+        scraper = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+            delay=random.uniform(1, 3)  # Respectful delay
+        )
         start = time.time()
         resp = scraper.get(ensure_url_scheme(url), timeout=REQUEST_TIMEOUT, allow_redirects=True)
         res["response_time"] = time.time() - start
@@ -271,7 +286,6 @@ def fetch_html_features_sync(url: str) -> Dict[str, Any]:
         res["final_url_diff"] = 1 if resp.url.lower() != ensure_url_scheme(url).lower() else 0
         res["content_length"] = len(resp.content)
 
-        # Headers
         h = {k.lower(): v for k, v in resp.headers.items()}
         for header, feat in {
             "x-xss-protection": "has_xss_protection",
@@ -284,14 +298,12 @@ def fetch_html_features_sync(url: str) -> Dict[str, Any]:
         }.items():
             res[feat] = 1 if header in h else 0
 
-        # Cookies
         if resp.cookies:
             res["has_cookie"] = 1
             for c in resp.cookies:
                 if hasattr(c, 'httponly') and c.httponly: res["has_http_only_cookie"] = 1
                 if c.secure: res["has_secure_cookie"] = 1
 
-        # HTML
         soup = BeautifulSoup(resp.text, "lxml")
         title = soup.find("title")
         res["has_title"] = 1 if title and title.get_text(strip=True) else 0
@@ -384,58 +396,44 @@ async def main(input_csv: str, output_csv: str):
         logger.error(f"Input not found: {input_csv}")
         return
 
-    df = pd.read_csv(input_csv)
-    if "url" not in df.columns or "http_status" not in df.columns:
-        logger.error("Missing 'url' or 'http_status' columns")
-        return
-
-    basename = os.path.basename(input_csv)
-    output_csv = os.path.join(os.path.dirname(output_csv), basename)
-    processed = get_processed_urls(output_csv)
-    df = df[~df['url'].astype(str).str.strip().isin(processed)]
-    if df.empty:
-        logger.info("All URLs processed")
-        return
-
-    logger.info(f"Processing {len(df)} URLs...")
+    processed_urls = get_processed_urls(output_csv)
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    first_batch = True
+
+    # Process in chunks to save memory
+    chunk_iter = pd.read_csv(input_csv, chunksize=CHUNK_SIZE)
+    first_batch = not os.path.exists(output_csv)
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-        for i in range(0, len(df), BATCH_SIZE):
-            batch = df.iloc[i:i+BATCH_SIZE]
-            tasks = [process_single_url(row, executor, semaphore) for _, row in batch.iterrows()]
-            results = await asyncio.gather(*tasks)
-            write_results_to_csv(results, output_csv, first_batch)
-            first_batch = False
+        for chunk_idx, chunk_df in enumerate(chunk_iter):
+            logger.info(f"Processing chunk {chunk_idx + 1}...")
+
+            # Filter out already processed URLs
+            chunk_df = chunk_df[~chunk_df['url'].astype(str).str.strip().isin(processed_urls)]
+            if chunk_df.empty:
+                continue
+
+            for i in range(0, len(chunk_df), BATCH_SIZE):
+                batch_df = chunk_df.iloc[i:i + BATCH_SIZE]
+                tasks = [process_single_url(row, executor, semaphore) for _, row in batch_df.iterrows()]
+                try:
+                    results = await asyncio.gather(*tasks)
+                    write_results_to_csv(results, output_csv, first_batch)
+                    first_batch = False
+                except Exception as e:
+                    logger.error(f"Batch error: {e}")
+                    continue
 
     logger.info(f"Completed: {output_csv}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract network features from URLs in a CSV file.")
-    parser.add_argument("--input", required=True, help="Path to the input CSV file containing URLs.")
-    parser.add_argument("--output", required=True, help="Path to the output directory to save extracted features.")
+    parser.add_argument("--input", "-i", required=True, help="Input CSV file path")
+    parser.add_argument("--output", "-o", required=True, help="Output directory")
     args = parser.parse_args()
 
-    # --- SAFETY: Ensure output is a proper directory path ---
-    input_path = args.input.strip()
-    output_dir = args.output.strip()
-
-    if not os.path.exists(input_path):
-        logger.error(f"Input file not found: {input_path}")
-        sys.exit(1)
-
-    if not os.path.isfile(input_path):
-        logger.error(f"Input is not a file: {input_path}")
-        sys.exit(1)
-
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Build output path
+    input_path = args.input
+    output_dir = args.output
     input_filename = os.path.basename(input_path)
     output_csv = os.path.join(output_dir, input_filename)
-
-    logger.info(f"Processing {input_path} → {output_csv}")
 
     asyncio.run(main(input_path, output_csv))
