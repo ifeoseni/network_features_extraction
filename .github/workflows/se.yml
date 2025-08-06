@@ -107,14 +107,14 @@ jobs:
         run: |
           python network_feature_extractor.py \
             --input "${{ matrix.input_file }}" \
-            --output "$(dirname "${{ matrix.output_file }})"
+            --output "${{ matrix.output_file }}"
 
       - name: Verify output
         run: |
           if [ -f "${{ matrix.output_file }}" ]; then
             echo "✅ Generated: ${{ matrix.output_file }}"
             rows=$(wc -l < "${{ matrix.output_file }}")
-            echo "📊 Total rows (including header): $((rows))"
+            echo "📊 Total rows (including header): $rows"
           else
             echo "::error::Failed to generate ${{ matrix.output_file }}"
             exit 1
@@ -123,7 +123,7 @@ jobs:
       - name: Upload Artifact (Per File)
         uses: actions/upload-artifact@v4
         with:
-          name: network-feature-${{ split(steps.set-matrix.outputs.matrix, '/')[1] | split('.csv')[0] }}
+          name: network-feature-$(basename "${{ matrix.input_file }}" .csv)
           path: ${{ matrix.output_file }}
 
   upload-all-artifacts:
@@ -133,7 +133,6 @@ jobs:
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
           path: artifacts/
 
       - name: List Artifacts
@@ -162,8 +161,8 @@ jobs:
         env:
           GIT_SSH_COMMAND: "ssh -i ${{ secrets.SSH_PRIVATE_KEY }} -o StrictHostKeyChecking=no"
         run: |
-          git config user.name "Ifeoluwa Oseni"
-          git config user.email "ifeoseni@gmail.com"
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
 
           # Add all CSVs in output folder
           OUTPUT_DIR="${{ github.event.inputs.output_folder }}"
@@ -171,7 +170,7 @@ jobs:
             git add "$OUTPUT_DIR"/*.csv
             if ! git diff --cached --quiet; then
               git commit -m "feat: add extracted network features [skip ci]"
-              git pull origin main --rebase || echo "Rebase conflict? Safe to retry."
+              git pull origin main --rebase
               git push origin main
               echo "🎉 Successfully pushed results to the repository"
             else
