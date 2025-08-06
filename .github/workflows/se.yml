@@ -3,17 +3,25 @@ name: Extract Network Features (Manual Matrix with Artifacts)
 on:
   workflow_dispatch:
     inputs:
-      files:
-        description: 'Comma-separated list of CSV files (e.g., http_status/1.csv,http_status/2.csv)'
+      file1:
+        description: "First CSV file path (e.g., http_status/1.csv)"
         required: true
-        type: string
+        default: "http_status/1.csv"
+      file2:
+        description: "Second CSV file path (optional)"
+        required: false
+        default: ""
+      file3:
+        description: "Third CSV file path (optional)"
+        required: false
+        default: ""
       output_folder:
-        description: 'Output folder for results (e.g., network_features)'
+        description: "Output folder for results (e.g., network_features)"
         required: true
-        default: 'network_features'
+        default: "network_features"
 
 jobs:
-  validate-and-split:
+  validate-inputs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -24,39 +32,28 @@ jobs:
           ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
           fetch-depth: 0
 
-      - name: Debug: List All CSV Files
+      - name: List All CSV Files
         run: |
-          echo "🔍 Searching for all CSV files in the repository..."
-          ALL_CSVS=$(find . -type f -name "*.csv" | sort)
-          if [ -z "$ALL_CSVS" ]; then
-            echo "::error::No CSV files found in the repository!"
-            echo "Please ensure your CSV files are committed and pushed."
-            exit 1
-          else
-            echo "$ALL_CSVS"
-          fi
-          echo "📂 Current directory: $(pwd)"
+          echo " Current directory: $(pwd)"
+          echo "🔍 Available CSV files:"
+          find . -type f -name "*.csv" | sort || echo "No CSV files found"
 
-      - name: Install jq (JSON processor)
-        run: sudo apt-get install -y jq
-
-      - name: Parse and Validate Input Files
+      - name: Validate and Build Matrix
         id: set-matrix
         shell: bash
         run: |
           IFS=',' read -ra FILE_LIST <<< "${{ github.event.inputs.files }}"
-          matrix_json='{"include": []}'
+          matrix_json="{\"include\": []}"
           valid_count=0
 
           for file in "${FILE_LIST[@]}"; do
-            file=$(echo "$file" | xargs)  # trim whitespace
+            file=$(echo "$file" | xargs)
             if [ -z "$file" ]; then continue; fi
 
             if [ -f "$file" ]; then
               echo "✅ Found input file: $file"
               output_file="${{ github.event.inputs.output_folder }}/$(basename "$file")"
-              matrix_json=$(echo "$matrix_json" | jq --arg in "$file" --arg out "$output_file" \
-                '.include += [{"input_file": $in, "output_file": $out}]')
+              matrix_json=$(echo "$matrix_json" | jq '.include += [{"input_file": "'"$file"'", "output_file": "'"$output_file"'"}]')
               valid_count=$((valid_count + 1))
             else
               echo "::error::File not found: $file"
@@ -64,6 +61,11 @@ jobs:
               find . -type f -name "*.csv" | xargs -I{} echo "  - {}"
               exit 1
             fi
+
+            output_file="${{ github.event.inputs.output_folder }}/$(basename "$file")"
+            matrix=$(echo "$matrix" | jq --arg in "$file" --arg out "$output_file" \
+              '.include += [{"input_file": $in, "output_file": $out}]')
+            valid_count=$((valid_count + 1))
           done
 
           if [ $valid_count -eq 0 ]; then
@@ -75,16 +77,16 @@ jobs:
           echo "✅ Generated matrix:"
           echo "$matrix_json" | jq
 
-  run-network-analysis:
-    needs: validate-and-split
+  extract-features:
+    needs: validate-inputs
     runs-on: ubuntu-latest
-    timeout-minutes: 350
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.validate-and-split.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.validate-inputs.outputs.matrix) }}
+    timeout-minutes: 350
 
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -107,14 +109,13 @@ jobs:
         run: |
           python network_feature_extractor.py \
             --input "${{ matrix.input_file }}" \
-            --output "${{ matrix.output_file }}"
+            --output "$(dirname "${{ matrix.output_file }}")"
 
-      - name: Verify output
+      - name: Verify output was created
         run: |
           if [ -f "${{ matrix.output_file }}" ]; then
             echo "✅ Generated: ${{ matrix.output_file }}"
-            rows=$(wc -l < "${{ matrix.output_file }}")
-            echo "📊 Total rows (including header): $rows"
+            echo "📊 Rows: $(wc -l < ${{ matrix.output_file }})"
           else
             echo "::error::Failed to generate ${{ matrix.output_file }}"
             exit 1
@@ -123,24 +124,25 @@ jobs:
       - name: Upload Artifact (Per File)
         uses: actions/upload-artifact@v4
         with:
-          name: network-feature-$(basename "${{ matrix.input_file }}" .csv)
+          name: ${{ env.ARTIFACT_NAME }}
           path: ${{ matrix.output_file }}
 
   upload-all-artifacts:
-    needs: run-network-analysis
+    needs: extract-features
     runs-on: ubuntu-latest
     steps:
-      - name: Download All Artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          merge-multiple: true
           path: artifacts/
 
-      - name: List Artifacts
+      - name: List all extracted features
         run: |
-          echo "📦 All extracted network features:"
+          echo "📦 All extracted files:"
           find artifacts/ -type f -name "*.csv" | xargs ls -la
 
-      - name: Upload Combined Artifacts
+      - name: Upload combined artifacts
         uses: actions/upload-artifact@v4
         with:
           name: all-network-features
@@ -157,25 +159,22 @@ jobs:
           ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
           fetch-depth: 0
 
-      - name: Add and commit network features
+      - name: Add and commit results
         env:
           GIT_SSH_COMMAND: "ssh -i ${{ secrets.SSH_PRIVATE_KEY }} -o StrictHostKeyChecking=no"
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
+          git config user.name "Ifeoluwa Oseni"
+          git config user.email "ifeoseni@gmail.com"
 
-          # Add all CSVs in output folder
           OUTPUT_DIR="${{ github.event.inputs.output_folder }}"
           if ls "$OUTPUT_DIR"/*.csv 1> /dev/null 2>&1; then
             git add "$OUTPUT_DIR"/*.csv
-            if ! git diff --cached --quiet; then
-              git commit -m "feat: add extracted network features [skip ci]"
-              git pull origin main --rebase
-              git push origin main
-              echo "🎉 Successfully pushed results to the repository"
-            else
-              echo "➡️ No changes to commit (files exist but no differences)"
-            fi
+
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: add extracted network features [skip ci]"
+            git pull origin main --rebase || echo "Rebase conflict? Safe to retry."
+            git push origin main
+            echo "🎉 Successfully pushed results to the repository"
           else
-            echo "🟡 No CSV files found in $OUTPUT_DIR to commit."
+            echo "➡️ No changes to commit"
           fi

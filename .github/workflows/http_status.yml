@@ -32,7 +32,7 @@ jobs:
           ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
           fetch-depth: 0
 
-      - name: Debug: List All CSV Files
+      - name: List All CSV Files
         run: |
           echo "📂 Current directory: $(pwd)"
           echo "🔍 Available CSV files:"
