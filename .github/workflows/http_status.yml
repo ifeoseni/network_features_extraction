@@ -32,7 +32,7 @@ jobs:
           ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
           fetch-depth: 0
 
-      - name: Install jq (JSON processor)
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Debug - List All CSV Files
@@ -45,13 +45,13 @@ jobs:
         id: set-matrix
         shell: bash
         run: |
-          set -euo pipefail  # Fail fast
+          set -euo pipefail
           inputs=("${{ github.event.inputs.file1 }}" "${{ github.event.inputs.file2 }}" "${{ github.event.inputs.file3 }}")
           matrix='{"include": []}'
           valid_count=0
 
           for file in "${inputs[@]}"; do
-            file=$(echo "$file" | xargs)
+            file=$(echo "$file" | xargs)  # trim whitespace
             if [ -z "$file" ]; then continue; fi
 
             if [ ! -f "$file" ]; then
@@ -73,7 +73,7 @@ jobs:
           fi
 
           echo "matrix=$(echo "$matrix" | jq -c .)" >> "$GITHUB_OUTPUT"
-          echo "✅ Matrix built for $valid_count file(s):"
+          echo "✅ Matrix built:"
           echo "$matrix" | jq
 
   extract-features:
@@ -115,16 +115,22 @@ jobs:
           if [ -f "${{ matrix.output_file }}" ]; then
             echo "✅ Output created: ${{ matrix.output_file }}"
             rows=$(wc -l < "${{ matrix.output_file }}")
-            echo "📊 Total rows (including header): $((rows))"
+            echo "📊 Total rows: $((rows))"
           else
             echo "::error::Failed to generate ${{ matrix.output_file }}"
             exit 1
           fi
 
+      - name: Extract filename for artifact
+        id: artifact-name
+        run: |
+          filename=$(basename "${{ matrix.output_file }}")
+          echo "ARTIFACT_NAME=$filename" >> $GITHUB_ENV
+
       - name: Upload Artifact (Per File)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ split(matrix.output_file, '/') | last }}
+          name: ${{ env.ARTIFACT_NAME }}
           path: ${{ matrix.output_file }}
 
   upload-all-artifacts:
@@ -176,8 +182,8 @@ jobs:
               git push origin main
               echo "🎉 Successfully pushed results to the repository"
             else
-              echo "➡️ No changes to commit (files exist but no differences)"
+              echo "➡️ No changes to commit"
             fi
           else
-            echo "🟡 No output files found in $OUTPUT_DIR to commit."
+            echo "🟡 No output files found to commit."
           fi
